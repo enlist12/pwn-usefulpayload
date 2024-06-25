@@ -160,7 +160,21 @@ li 指令用于将一个立即数（immediate value）加载到指定的寄存�
 
 但注意看，我们其实只是取了size的低8位，所以size的高八位其实不会影响我们的检测，
 
-例如 0x73740060和0x00000060效果其实是一样的，这样有利于我们伪造chunk，躲过fastbin的size检测
+例如 0x737400000060和0x00000060效果其实是一样的，这样有利于我们伪造chunk，躲过fastbin的size检测
+
+
+
+### realloc_hook调整栈帧
+
+realloc_hook在malloc_hook-0x8的位置，某些时候所有的one_gadget都不能起效，可以通过在malloc_hook上写realloc函数一定的偏移
+
+来达到调整栈帧的目的，在realloc_hook上写one_gadget来解决。
+
+![image-20240519195732050](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240519195732050.png)
+
+
+
+
 
 
 
@@ -220,6 +234,8 @@ vsyscall是第一种也是最古老的一种用于加快系统调用的机制，
 
 * 通过阅读glibc2.29源码，我们得知calloc不会从tcache bin里取空闲的chunk，而是从fastbin里取，取完后，和malloc一样，如果fastbin里还有剩余的chunk，则全部放到对应的tcache bin里取，采用头插法。
 * 当程序已经运行了一个alarm函数时 此时我们再次执行另一个alarm函数 就会返回第一个alarm函数所设定的时间已经经过的时间,返回值是保存在eax或rax中，例如，可以sleep(4)，然后触发alarm函数，就能将eax赋值为4，然后执行open函数
+* 进制转换：一个负数value转换成对应的32位有符号整数下的16进制，value&0xffffffff。一个16进制数value转换成32位有符号整数下表示的负数,value-pow(2,32)
+* gdb运行程序和gdb挂载程序初始的env是不一样的，所以会有差异，做题都是以gdb挂载的环境为主
 
 
 
@@ -269,19 +285,41 @@ p &_IO_2_1_stdout_
 
 
 
-### 有疑惑的题
-
-https://www.nssctf.cn/problem/832
-
-[[MTCTF 2021\]Bookshop | NSSCTF](https://www.nssctf.cn/problem/1137)
-
-
-
 ### 输入
 
 scanf和gets一样，在遇到换行符或空字符会停止输入，但会在字符串末尾自动补上空字符，会造成栈上的off-by-null。
 
 例如scanf("%256s",s)，最后会补上空字符，所以其实输入了257个字符。
+
+
+
+### 指令输入与表示
+
+二进制可执行文件都是机器码表示，ida是根据机器码将其翻译成汇编代码，其中可能出现失误，点击undfine，重新code就可以了。
+
+![img](file:///C:\Users\29987\Documents\Tencent Files\2998735282\nt_qq\nt_data\Pic\2024-05\Ori\530e31e01a69a1dfee63ff191010e102.png)
+
+one_gadget则是采用断章取义的方式，逐个字节搜索翻译，翻译结果可能和ida不同。
+
+
+
+### magicgadget
+
+![image-20240523191841312](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240523191841312.png)
+
+al为rax的最低一位
+
+~~~python
+p64(rdi) + p64(pro_base + elf.got['read']) + p64(rax) + p64(0x10) + p64(magic)
+~~~
+
+这样将read的got表中的内容增加了0x10。
+
+![image-20240523192038951](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240523192038951.png)
+
+正好对应**syscall**
+
+在没有syscall这个gadget也不知道libc的基址的情况下也能调用syscall。
 
 
 
@@ -444,8 +482,141 @@ struct dtor_list
 
 
 
+### io file
+
+#### largebin attack
+
+此处针对高版本，向任意地址写入一个堆地址
+
+~~~c
+if ((unsigned long) (size) < (unsigned long) chunksize_nomask (bck->bk))
+                      {
+                          fwd = bck;
+                          bck = bck->bk;
+
+                          victim->fd_nextsize = fwd->fd;
+                          victim->bk_nextsize = fwd->fd->bk_nextsize;
+                          fwd->fd->bk_nextsize = victim->bk_nextsize->fd_nextsize = victim;
+                      }
+~~~
+
+先将chunk1释放进largebin，并将chunk1->bk_nextsize修改为target-0x20
+
+然后释放chunk2进入largebin，确保chunk2的size小于chunk1,并且两个chunk在同一条链上
+
+则有：
+
+~~~c
+*(chunk2+0x20)=chunk1
+*(chunk2+0x28)=*(chunk1+0x28)=target-0x20
+*(chunk1+0x28)=*target=chunk2
+~~~
+
+成功在target写入堆地址
 
 
 
+#### house of apple2
 
-​	
+**利用条件**
+
+使用`house of apple`的条件为：
+1、程序从`main`函数返回或能调用`exit`函数
+2、能泄露出`heap`地址和`libc`地址
+3、 能使用一次`largebin attack`（一次即可）
+
+![image-20240519132116665](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240519132116665.png)
+
+
+
+其中，`IO_validate_vtable`函数负责检查`vtable`的合法性，会判断`vtable`的地址是不是在一个合法的区间。如果`vtable`的地址不合法，程序将会异常终止。
+
+```c
+pwndbg> p *_IO_list_all
+$2 = {
+  file = {
+    _flags = -72540025,
+    _IO_read_ptr = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_read_end = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_read_base = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_write_base = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_write_ptr = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_write_end = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_buf_base = 0x7ff1eaad7643 <_IO_2_1_stderr_+131> "",
+    _IO_buf_end = 0x7ff1eaad7644 <_IO_2_1_stderr_+132> "",
+    _IO_save_base = 0x0,
+    _IO_backup_base = 0x0,
+    _IO_save_end = 0x0,
+    _markers = 0x0,
+    _chain = 0x7ff1eaad76a0 <_IO_2_1_stdout_>,
+    _fileno = 2,
+    _flags2 = 0,
+    _old_offset = -1,
+    _cur_column = 0,
+    _vtable_offset = 0 '\000',
+    _shortbuf = "",
+    _lock = 0x7ff1eaad87d0 <_IO_stdfile_2_lock>,
+    _offset = -1,
+    _codecvt = 0x0,
+    _wide_data = 0x7ff1eaad6780 <_IO_wide_data_2>,//这个变量是我们需要劫持的
+    _freeres_list = 0x0,
+    _freeres_buf = 0x0,
+    __pad5 = 0,
+    _mode = 0,
+    _unused2 = '\000' <repeats 19 times>
+  },
+  vtable = 0x7ff1eaad34a0 <_IO_file_jumps>//vtable
+}
+```
+
+但是 `_wide_data` 这个成员很特殊，这个成员结构体中的 `_wide_vtable`和调用vtable里函数指针一样，在调用 `_wide_vtable` 虚表里面的函数时，也同样是使用宏去调用，但其没有关于vtable的合法性检查
+
+![image-20240519132534205](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240519132534205.png)
+
+![image-20240519132639012](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240519132639012.png)
+
+![image-20240519133004693](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240519133004693.png)
+
+**注意事项**
+
+* io_list周围分布着许多结构体，尽量保证用larginbin attack写堆地址或者确保堆分配后不会memset(0)
+* 无法避免时可以gdb调试，计算偏移来伪造
+* wide_data 0xa0,vtable-->wfile 0xd8,wfile->vtable 0xe0,最后是0x68
+
+![image-20240604174347972](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240604174347972.png)
+
+![image-20240604174430372](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240604174430372.png)
+
+
+
+### unsortedbin attack + FSOP
+
+此方法仅在 libc 2.23及以下适用（伪造虚表）
+
+victim->bk=target-0x10
+
+这样设置好后，用方法使vitcim脱链，这样target处就会被写上unsortedbin的地址。
+
+**用处一**
+
+在任意地址写一个很大的值，充当count或size等。
+
+**用处二**
+
+在_IO_list_all写上这个地址，想办法触发io流，chain的位置是smallbin[0x60]的地址，可以伪造io。
+
+不过伪造io时要注意一些限制：
+
+![image-20240612152813318](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240612152813318.png)
+
+mode偏移是0xc0，vtable偏移是0xd8
+
+此方法优点是可以在不能free的情况下达到getshell的目的
+
+overflow的偏移为0x18(第四项)，p64(0)*3+p64(system)
+
+![image-20240612221549529](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240612221549529.png)
+
+1情况，可以是破坏了unsortedbin结构。
+
+![image-20240612221727571](C:\Users\29987\AppData\Roaming\Typora\typora-user-images\image-20240612221727571.png)
